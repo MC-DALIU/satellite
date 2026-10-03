@@ -1132,7 +1132,12 @@ class MainWindow(QMainWindow):
             self._setBanner(f"保存失败：{e}", "fail")
 
     def _saveConfig(self) -> None:
+        previous = FY4B.loadConfig()
         self.cfg = self._uiToConfig()
+        crop_changed = any(
+            previous.get(key) != self.cfg.get(key)
+            for key in ("crop_x", "crop_y", "crop_w", "crop_h", "jpeg_quality")
+        )
         try:
             FY4B.saveConfig(self.cfg)
         except OSError as e:
@@ -1157,8 +1162,12 @@ class MainWindow(QMainWindow):
                 return
 
         self._setBanner(f"✓ 设置已保存 → {FY4B.configPath}{note}", "ok")
-        self.statusBar().showMessage(f"设置已保存到 {FY4B.configPath}")
         self._refreshStatus()
+        # 放在 _refreshStatus 之后，否则这条提示会被通用状态冲掉
+        if crop_changed:
+            self.statusBar().showMessage(
+                "裁切/质量已改：点「裁切并应用」立刻生效，否则等下一个更新点"
+            )
 
     def _resetConfig(self) -> None:
         self.cfg = dict(FY4B.DEFAULT_CONFIG)
@@ -1202,8 +1211,8 @@ class MainWindow(QMainWindow):
     def _onSucceeded(self, message: str) -> None:
         self._updateRunning = False
         self.cfg = FY4B.loadConfig()
+        # 结果看横幅，状态栏留给「当前状态」，所以这里不再重复写状态栏
         self._setBanner(f"✓ {message}", "ok")
-        self.statusBar().showMessage(message)
         if self.worker is not None and self.worker.action in ("download", "update"):
             self._loadPreview()
         self._updateInfo()
@@ -1253,6 +1262,45 @@ class MainWindow(QMainWindow):
             return
 
         self._startScheduler()
+        self._maybeStartupUpdate()
+
+    def _maybeStartupUpdate(self) -> None:
+        """
+        启动时如果壁纸已经过期，就先更新一张，别干等到下一个分钟点
+
+        开机自启动的场景最明显：10:20 登录，如果分钟点是 10,25,40,55，
+        原来的实现要等到 10:25 才有动静。阈值看 startup_max_age（分钟）：
+        正数=超过这么久就更新，0=每次都更新，负数=启动不更新。
+        """
+        cfg = FY4B.loadConfig()
+        if not cfg.get("schedule_enabled", True) or cfg.get("rotation_paused"):
+            return
+        try:
+            limit = int(cfg.get("startup_max_age", 20))
+        except (TypeError, ValueError):
+            limit = 20
+        if limit < 0:
+            return
+
+        last = str(cfg.get("last_applied") or "")
+        if limit > 0 and last and os.path.isfile(last):
+            age_min = (time.time() - os.path.getmtime(last)) / 60
+            if age_min < limit:
+                FY4B.logger.info(
+                    f"启动检查：上次更新在 {age_min:.0f} 分钟前（阈值 {limit} 分钟），"
+                    f"不重复下载，等下一个更新点 {self.minutesEdit.text().strip()}"
+                )
+                self._setBanner(
+                    f"上次更新在 {age_min:.0f} 分钟前，还够新；"
+                    f"等下一个更新点（{self.minutesEdit.text().strip()}）。",
+                    "info",
+                )
+                return
+            reason = f"上次更新在 {age_min:.0f} 分钟前，已超过 {limit} 分钟"
+        else:
+            reason = "还没有可用的上次更新记录"
+        FY4B.logger.info(f"启动检查：{reason}，先更新一张再进入定时")
+        self._runAction("update")
 
     def _startScheduler(self) -> None:
         """起定时任务；配置里关掉定时更新就不起"""
@@ -1337,6 +1385,9 @@ class MainWindow(QMainWindow):
 
     def _scheduledUpdate(self) -> None:
         """跑在 APScheduler 的线程里，不能直接碰界面控件，只能发信号"""
+        if self._updateRunning:
+            FY4B.logger.info("正在手动更新，跳过本次定时任务")
+            return
         self.bridge.started.emit()
         try:
             path = FY4B.update()

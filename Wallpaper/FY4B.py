@@ -55,6 +55,7 @@ DEFAULT_CONFIG = {
     "wallpaper_backend": "auto",  # auto / KDE / niri
     "schedule_enabled": True,
     "schedule_minutes": "10,25,40,55",
+    "startup_max_age": 20,  # 启动时若上次更新已超过这么多分钟就立刻更新一张
     "request_timeout": 60,
     "verify": True,
     # ---- 界面模式与后台行为 ----

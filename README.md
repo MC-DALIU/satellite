@@ -188,6 +188,7 @@ python3 Wallpaper/FY4B.py --gui        # 打开图形界面
 | `autostart` | `false` | 开机自启动（实际看 `~/.config/autostart/` 里有没有那个文件） |
 | `watch_wallpaper` | `true` | 是否检测壁纸被手动更换 |
 | `watch_interval` | `60` | 检测间隔（秒） |
+| `startup_max_age` | `20` | 启动时若上次更新已超过这么多分钟就立刻更新一张（`0`=每次启动都更新，负数=启动不更新，只等定时） |
 | `rotation_paused` | `false` | 轮换是否已暂停（由检测自动置位，点「恢复轮换」清除） |
 | `last_applied` | `""` | 最近一次成功设置的壁纸，用于判断有没有被换掉 |
 | `request_timeout` | `60` | 下载超时（秒） |
