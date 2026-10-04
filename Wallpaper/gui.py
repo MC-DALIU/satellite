@@ -11,6 +11,11 @@ import os
 import sys
 import time
 
+# 依赖自检放在 PyQt5 之前：缺包时给一句人话提示（首次运行还会自动装）
+import deps
+
+deps.require(deps.GUI_MODULES, auto=True, title="FY4B 界面")
+
 from PyQt5.QtCore import (
     QObject,
     QPoint,
@@ -62,6 +67,7 @@ from filelock import Timeout
 from PIL import Image
 
 import FY4B
+import backends
 
 # 单实例用的本地 socket 名字（第二次启动会通过它把已有窗口叫出来）
 SERVER_NAME = "fy4b-wallpaper"
@@ -817,7 +823,8 @@ class MainWindow(QMainWindow):
         gb_be = QGroupBox("壁纸后端")
         f_be = QFormLayout(gb_be)
         self.backendCombo = QComboBox()
-        self.backendCombo.addItems(["auto", "KDE", "niri"])
+        # 清单来自 backends.py 的注册表：以后加 GNOME/XFCE 只要在那里注册一行
+        self.backendCombo.addItems(backends.backendChoices())
         f_be.addRow("方式", self.backendCombo)
         self.backendLabel = QLabel("—")
         self.backendLabel.setStyleSheet("color:#909098;")

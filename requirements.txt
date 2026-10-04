@@ -1,0 +1,7 @@
+# 核心依赖：命令行模式（python Wallpaper/FY4B.py）只需要这些
+pillow>=9
+filelock>=3
+apscheduler>=3.9
+
+# 图形界面额外需要（只跑命令行可以不装）
+PyQt5>=5.15

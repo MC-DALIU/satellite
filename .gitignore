@@ -1,2 +1,5 @@
 __pycache__/
 *.py[cod]
+# 打包传到别的机器用的临时归档
+*.tar.gz
+*.zip

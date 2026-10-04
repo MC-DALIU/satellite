@@ -1,4 +1,4 @@
-#! /bin/python
+#!/usr/bin/env python3
 """
 风云四号 B 星云图壁纸
 
@@ -15,6 +15,7 @@
 import argparse
 import datetime
 import glob
+import http.client
 import json
 import logging
 import os
@@ -24,16 +25,49 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 
-import requests
+# 依赖自检必须放在第三方 import 之前：缺包时说人话，而不是甩一屏 traceback
+import deps
+
+deps.require(deps.CORE_MODULES, auto=__name__ == "__main__")
+
 from apscheduler.schedulers.background import BackgroundScheduler
 from filelock import FileLock, Timeout
 from PIL import Image
 
+import backends
+
 HOME = os.environ.get("HOME") or os.path.expanduser("~")
-downloadPath = os.path.join(HOME, ".cache", "fy4b") + os.sep
-configDir = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
-configPath = os.path.join(configDir, "fy4b", "config.json")
+
+#: 有些 WAF 会拦 Python 默认的 UA，伪装成普通客户端
+USER_AGENT = "Mozilla/5.0 (compatible; FY4B-wallpaper)"
+
+
+def platformPaths(
+    system: str | None = None, environ: dict | None = None
+) -> tuple[str, str]:
+    """
+    算出「数据目录」和「配置目录」，返回 (cacheDir, configDir)
+
+    Linux 走 XDG 约定，Windows 走 LOCALAPPDATA / APPDATA。
+    单独抽成函数是为了能直接用假路径做单元测试。
+    """
+    system = system or platform.system()
+    env = environ if environ is not None else os.environ
+    home = env.get("HOME") or os.path.expanduser("~")
+    if system == "Windows":
+        roaming = env.get("APPDATA") or home
+        local = env.get("LOCALAPPDATA") or roaming
+        return os.path.join(local, "fy4b"), os.path.join(roaming, "fy4b")
+    xdgConfig = env.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+    return os.path.join(home, ".cache", "fy4b"), os.path.join(xdgConfig, "fy4b")
+
+
+cacheDir, configDir = platformPaths()
+downloadPath = cacheDir + os.sep
+configPath = os.path.join(configDir, "config.json")
 autostartPath = os.path.join(configDir, "autostart", "fy4b-wallpaper.desktop")
 lockPath = os.path.join(downloadPath, "app.lock")
 pidPath = os.path.join(downloadPath, "app.pid")
@@ -208,9 +242,9 @@ def downloadWallpaper(cfg: dict | None = None) -> str:
     """
     下载壁纸原图
 
-    和旧版相比：所有 requests 异常都会重试、检查 HTTP 状态码、先写临时文件
-    再原子替换（避免中途失败留下半张图让人误用）。临时文件名带上 pid，这样
-    常驻进程和图形界面同时下载也不会互相踩，raw.jpg 永远是完整的。
+    用标准库 urllib 而不是 requests：只为一次 GET 引入 requests 及其 4 个依赖
+    不划算。所有异常都会重试、检查状态码；先写带 pid 的临时文件再原子替换，
+    避免中途失败留下半张图，也让界面和守护进程能安全地同时下载。
     """
     cfg = cfg or loadConfig()
     checkDir(downloadPath)
@@ -224,16 +258,16 @@ def downloadWallpaper(cfg: dict | None = None) -> str:
     for attempt in range(1, max_retry + 1):
         try:
             logger.info(f"下载中（第 {attempt}/{max_retry} 次）：{url}")
-            res = requests.get(url, timeout=cfg["request_timeout"])
-            res.raise_for_status()
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=cfg["request_timeout"]) as resp:
+                data = resp.read()
             with open(tmpFile, "wb") as f:
-                f.write(res.content)
+                f.write(data)
             os.replace(tmpFile, downloadFile)
-            logger.info(
-                f"下载成功：{len(res.content) / 1024 / 1024:.1f} MiB → {downloadFile}"
-            )
+            logger.info(f"下载成功：{len(data) / 1024 / 1024:.1f} MiB → {downloadFile}")
             return downloadFile
-        except requests.exceptions.RequestException as e:
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
+            # HTTPError 是 URLError 的子类；超时是 OSError 的子类
             last_error = e
             logger.error(f"下载失败（第 {attempt}/{max_retry} 次）：{type(e).__name__}: {e}")
             if attempt < max_retry:
@@ -244,7 +278,6 @@ def downloadWallpaper(cfg: dict | None = None) -> str:
     except OSError:
         pass
     raise RuntimeError(f"下载失败，已重试 {max_retry} 次：{last_error}")
-
 
 def cropWallpaper(image_path: str, cfg: dict | None = None) -> str:
     """
@@ -296,24 +329,13 @@ def cleanOldWallpaper(keep: int = 2) -> None:
 
 
 def detectBackend(cfg: dict | None = None) -> str:
-    """决定用哪个后端设置壁纸：配置写死了就用配置的，否则看桌面环境"""
+    """
+    决定用哪个后端：配置写死了就用配置的，否则交给 backends 自动识别
+
+    真正的后端实现都在 backends.py 里，这里只是薄薄一层。
+    """
     cfg = cfg or loadConfig()
-    backend = str(cfg.get("wallpaper_backend", "auto"))
-    if backend != "auto":
-        return backend
-
-    desktop = os.environ.get("XDG_CURRENT_DESKTOP", "")
-    names = [name.lower() for name in desktop.replace(":", ";").split(";") if name]
-    if any("kde" in name for name in names):
-        return "KDE"
-    if any("niri" in name for name in names):
-        return "niri"
-
-    osName = platform.system()
-    if osName == "Windows":
-        return "dwm"
-    return "unknown"
-
+    return backends.detectBackendName(str(cfg.get("wallpaper_backend", "auto")))
 
 def isDaemonRunning() -> bool:
     """
@@ -339,8 +361,16 @@ def isDaemonRunning() -> bool:
 
 
 def _pidAlive(pid: int) -> bool:
+    """
+    进程还在不在
+
+    ⚠️ Windows 上绝不能用 os.kill(pid, 0)：Python 在 Windows 上对普通信号
+    会调 TerminateProcess —— 那等于把被检查的进程直接杀掉，而不是"探活"。
+    """
     if not pid or pid <= 0:
         return False
+    if platform.system() == "Windows":
+        return _pidAliveWindows(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -351,6 +381,24 @@ def _pidAlive(pid: int) -> bool:
         return False
     return True
 
+
+def _pidAliveWindows(pid: int) -> bool:
+    """Windows 上问内核这个 pid 还在不在（只查询，不动它）"""
+    import ctypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return False
+    try:
+        code = ctypes.c_ulong()
+        if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return code.value == STILL_ACTIVE
+        return True  # 拿不到退出码就当它还活着
+    finally:
+        kernel32.CloseHandle(handle)
 
 def _pidLooksLikeUs(pid: int) -> bool:
     """确认这个 pid 确实是在跑本程序，避免 pid 被复用后误杀别人的进程"""
@@ -454,12 +502,19 @@ def startDaemon(extra_args: list[str] | None = None) -> int:
     """
     另起一个常驻进程，返回它的 pid
 
-    用 start_new_session 让它脱离当前进程组，这样图形界面关掉、或者终端里
-    Ctrl+C，都不会牵连到它。
+    让新进程脱离当前会话：图形界面关掉、或者终端里 Ctrl+C，都不会牵连到它。
+    Windows 上 start_new_session 是 POSIX 专用的，得改用 creationflags。
     """
     checkDir(downloadPath)
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "FY4B.py")
     out = open(os.path.join(downloadPath, "daemon.out"), "ab")
+    detach: dict = {}
+    if platform.system() == "Windows":
+        detach["creationflags"] = getattr(subprocess, "DETACHED_PROCESS", 0x00000008) | getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200
+        )
+    else:
+        detach["start_new_session"] = True
     try:
         proc = subprocess.Popen(
             [sys.executable, script, *(extra_args or [])],
@@ -467,32 +522,43 @@ def startDaemon(extra_args: list[str] | None = None) -> int:
             stdout=out,
             stderr=subprocess.STDOUT,
             cwd=os.path.dirname(script),
-            start_new_session=True,
+            **detach,
         )
     finally:
         out.close()
     logger.info(f"已启动常驻服务，pid {proc.pid}")
     return proc.pid
 
-
 def stopDaemon(pid: int | None = None, timeout: float = 15.0) -> bool:
-    """停掉常驻服务（先 SIGTERM，超时不走就 SIGKILL），返回是否已停止"""
+    """停掉常驻服务，返回是否已停止（POSIX 先 SIGTERM 再 SIGKILL）"""
     pid = pid or daemonPid()
     if not pid:
         return True
 
-    try:
-        os.kill(pid, signal.SIGTERM)
-        logger.info(f"已向常驻服务 {pid} 发送 SIGTERM")
-    except OSError as e:
-        logger.warning(f"停止常驻服务失败：{e}")
-        return True
+    if platform.system() == "Windows":
+        # Windows 没有可捕获的 SIGTERM，直接 taskkill（连带子进程）
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True,
+                timeout=timeout,
+            )
+            logger.info(f"已用 taskkill 结束常驻服务 {pid}")
+        except (OSError, subprocess.SubprocessError) as e:
+            logger.warning(f"停止常驻服务失败：{e}")
+    else:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            logger.info(f"已向常驻服务 {pid} 发送 SIGTERM")
+        except OSError as e:
+            logger.warning(f"停止常驻服务失败：{e}")
+            return True
 
     deadline = time.time() + timeout
     while time.time() < deadline and _pidAlive(pid):
         time.sleep(0.2)
 
-    if _pidAlive(pid):
+    if _pidAlive(pid) and platform.system() != "Windows":
         logger.warning(f"常驻服务 {pid} 没有响应 SIGTERM，改用 SIGKILL")
         try:
             os.kill(pid, signal.SIGKILL)
@@ -508,146 +574,122 @@ def stopDaemon(pid: int | None = None, timeout: float = 15.0) -> bool:
             pass
     return not alive
 
-
 def getEnv() -> str:
     """获取系统环境，返回窗口管理器的信息（只用于日志）"""
     osName = platform.system()
     desktop = os.environ.get("XDG_CURRENT_DESKTOP") or "unknown"
-    logger.info(f"操作系统：{osName}, 窗口环境：{desktop}")
+    logger.info(f"操作系统：{osName}, 窗口环境：{desktop}, 壁纸后端：{detectBackend()}")
     return desktop
 
-
 def setWallpaper_KDE(path: str) -> None:
-    """
-    KDE Plasma 修改壁纸
-    用 dbus，解决 plasma-apply-wallpaperimage 自作聪明的问题
+    """（兼容旧调用）直接交给 KDE 后端；实现在 backends.py 里"""
+    backends.getBackend("KDE").setWallpaper(path)
 
-    注意：Plasma 只有在配置项 Image 的取值发生变化时才会重新加载壁纸，
-    所以调用方必须保证每次传入的路径都不一样（见 cropWallpaper）。
-    另外顺手把 PreviewImage 写成 "null"：壁纸插件在 PreviewImage 不等于
-    "null" 时会优先显示这张预览图而不是 Image，写掉它可以避免配置里
-    残留的旧预览图让新壁纸显示不出来。
-    """
-    import dbus
-    from urllib.parse import quote
-
-    if not os.path.isfile(path):
-        raise FileNotFoundError(path)
-
-    abs_path = os.path.abspath(path)
-    file_url = "file://" + quote(abs_path, safe="/:@")
-
-    script = f"""
-        var ds = desktops();
-        for (var i = 0; i < ds.length; i++) {{
-            var d = ds[i];
-            d.wallpaperPlugin = 'org.kde.image';
-            d.currentConfigGroup = ['Wallpaper', 'org.kde.image', 'General'];
-            d.writeConfig('Image', '{file_url}');
-            d.writeConfig('PreviewImage', 'null');
-        }}
-    """
-    bus = dbus.SessionBus()
-    plasma = bus.get_object('org.kde.plasmashell', '/PlasmaShell')
-    plasma.evaluateScript(script, dbus_interface='org.kde.PlasmaShell')
-
-
-def plasmaWallpaper(screen: int) -> str | None:
-    """
-    读回 Plasma 当前真正在用的壁纸路径
-
-    org.kde.PlasmaShell.wallpaper 是从运行中的壁纸插件读的，不是读磁盘上的
-    配置文件，所以它反映的是实时状态，不会因为配置没落盘而撒谎。
-    """
-    import dbus
-
-    bus = dbus.SessionBus()
-    plasma = bus.get_object('org.kde.plasmashell', '/PlasmaShell')
-    info = plasma.wallpaper(dbus.UInt32(screen), dbus_interface='org.kde.PlasmaShell')
-    image = info.get('Image')
-    return str(image) if image else None
-
+def plasmaWallpaper(screen: int = 0) -> str | None:
+    """（兼容旧调用）读回 Plasma 当前在用的壁纸；实现在 backends.py 里"""
+    return backends.getBackend("KDE").currentWallpaper(screen)
 
 def verifyWallpaper(image_path: str, backend: str | None = None) -> bool:
     """
     自检：回读桌面环境当前在用的壁纸，和刚写入的路径比对，结果写进日志
 
-    这样每轮更新之后 fy4b.log 里都会有一行明确的结论，不用去盯着云图看
-    有没有变化。只有 KDE 有回读接口，其他后端直接跳过。
+    这样每轮更新之后 fy4b.log 里都会有一行明确的结论，不用盯着云图看变化。
+    后端不支持回读时直接算通过，不误报。
     """
-    backend = backend or detectBackend()
-    if backend != "KDE":
+    name = backend or detectBackend()
+    impl = backends.getBackend(name)
+    if impl is None or not impl.readable:
+        logger.debug(f"后端 {name} 不支持回读，跳过自检")
         return True
 
-    try:
-        from urllib.parse import quote, unquote
-
-        expect = "file://" + quote(os.path.abspath(image_path), safe="/:@")
-        screens: list[tuple[int, str]] = []
-        for screen in range(16):
-            current = plasmaWallpaper(screen)
-            if not current:
-                break
-            screens.append((screen, current))
-
-        if not screens:
-            logger.warning("自检未通过：读不到 Plasma 的壁纸状态")
-            return False
-
-        mismatched = [(s, c) for s, c in screens if unquote(c) != unquote(expect)]
-        if mismatched:
-            for screen, current in mismatched:
-                logger.warning(
-                    f"自检未通过：screen {screen} 实际在用 "
-                    f"{os.path.basename(unquote(current))}，"
-                    f"本轮写入 {os.path.basename(unquote(expect))}"
-                )
-            return False
-
-        logger.info(
-            f"自检通过：{len(screens)} 块屏都已切到 {os.path.basename(unquote(expect))}"
-        )
-        return True
-    except Exception as e:
-        logger.warning(f"自检失败（{type(e).__name__}: {e}）")
+    # 注意别在这里对 URL 调 abspath，会把 file:///... 拼成本地路径
+    expect = normalizeWallpaper(image_path)
+    screens = currentWallpapers(name)
+    if not screens:
+        logger.warning(f"自检未通过：读不到 {name} 的壁纸状态")
         return False
+
+    mismatched = [(s, c) for s, c in screens if normalizeWallpaper(c) != expect]
+    if mismatched:
+        for screen, current in mismatched:
+            logger.warning(
+                f"自检未通过：screen {screen} 实际在用 "
+                f"{os.path.basename(normalizeWallpaper(current))}，"
+                f"本轮写入 {os.path.basename(expect)}"
+            )
+        return False
+
+    logger.info(f"自检通过：{len(screens)} 块屏都已切到 {os.path.basename(expect)}")
+    return True
+
+def normalizeWallpaper(value: str | None) -> str:
+    """
+    把各种写法的壁纸路径统一成可比对的形式
+
+    要处理：file:// URL、URL 编码、Windows 反斜杠、大小写差异。
+    统一返回正斜杠、小写的路径；空值返回空串。
+    """
+    if not value:
+        return ""
+    from urllib.parse import unquote
+
+    text = unquote(str(value))
+    if text.startswith("file://"):
+        text = text[7:]
+    # file:///C:/Users/... → C:/Users/...
+    if len(text) > 2 and text[0] == "/" and text[2] == ":":
+        text = text[1:]
+    text = text.replace("\\", "/")
+    # 相对路径补全成绝对路径，否则和回读到的绝对路径没法比
+    if not os.path.isabs(text) and not (len(text) > 1 and text[1] == ":"):
+        text = os.path.abspath(text)
+    return os.path.normpath(text).replace("\\", "/").casefold()
 
 
 def isOurWallpaper(url: str | None) -> bool:
     """判断这个壁纸路径是不是我们自己生成的那批文件"""
-    if not url:
+    path = normalizeWallpaper(url)
+    if not path:
         return False
-    from urllib.parse import unquote
-
-    path = unquote(url[7:]) if url.startswith("file://") else url
-    path = os.path.abspath(path)
-    if os.path.dirname(path) != os.path.abspath(downloadPath):
+    if os.path.dirname(path) != normalizeWallpaper(downloadPath):
         return False
     name = os.path.basename(path)
     return name.startswith("end") and name.endswith(".jpg")
 
+def currentWallpapers(backend: str | None = None) -> list[tuple[int, str]] | None:
+    """
+    回读各屏幕当前在用的壁纸
 
-def foreignWallpaperScreens() -> list[tuple[int, str]] | None:
+    返回 None 表示当前后端不支持回读（或者读不到），
+    空列表表示一个值都没读到。
+    """
+    impl = backends.getBackend(backend or detectBackend())
+    if impl is None or not impl.readable:
+        return None
+    result: list[tuple[int, str]] = []
+    for screen in range(16):
+        try:
+            current = impl.currentWallpaper(screen)
+        except Exception as e:
+            logger.debug(f"回读壁纸失败：{type(e).__name__}: {e}")
+            return None
+        if not current:
+            break
+        result.append((screen, current))
+    return result
+
+
+def foreignWallpaperScreens(backend: str | None = None) -> list[tuple[int, str]] | None:
     """
     列出壁纸被换成了「不是我们设的文件」的屏幕
 
-    返回 None 表示读不到（不是 KDE，或者 plasmashell 没在跑），空列表表示都正常。
+    返回 None 表示读不到（后端不支持回读，或者壁纸服务没在跑），
+    空列表表示都正常。
     """
-    if detectBackend() != "KDE":
+    screens = currentWallpapers(backend)
+    if screens is None:
         return None
-    result: list[tuple[int, str]] = []
-    try:
-        for screen in range(16):
-            current = plasmaWallpaper(screen)
-            if not current:
-                break
-            if not isOurWallpaper(current):
-                result.append((screen, current))
-    except Exception as e:
-        logger.debug(f"读取壁纸状态失败：{type(e).__name__}: {e}")
-        return None
-    return result
-
+    return [(s, url) for s, url in screens if not isOurWallpaper(url)]
 
 def setPaused(paused: bool) -> dict:
     """暂停 / 恢复自动轮换（状态写在配置里，各模式、各进程共享）"""
@@ -672,7 +714,10 @@ def recordApplied(path: str) -> None:
 
 
 def notify(title: str, body: str) -> bool:
-    """发一条桌面通知（先走 freedesktop 通知服务，不行就退回 notify-send）"""
+    """发一条桌面通知（Windows 走 PowerShell 气泡，Linux 走 freedesktop 通知服务）"""
+    if platform.system() == "Windows":
+        return _notifyWindows(title, body)
+
     try:
         import dbus
 
@@ -707,13 +752,49 @@ def notify(title: str, body: str) -> bool:
         return False
 
 
+def _notifyWindows(title: str, body: str) -> bool:
+    """Windows 上借 PowerShell 弹个气泡通知（不额外依赖任何库）"""
+
+    def escape(text: str) -> str:
+        return str(text).replace("'", "''").replace("\n", " ")
+
+    script = (
+        "[reflection.assembly]::LoadWithPartialName('System.Windows.Forms')|Out-Null;"
+        "[reflection.assembly]::LoadWithPartialName('System.Drawing')|Out-Null;"
+        "$n=New-Object System.Windows.Forms.NotifyIcon;"
+        "$n.Icon=[System.Drawing.SystemIcons]::Information;"
+        "$n.Visible=$true;"
+        f"$n.ShowBalloonTip(10000,'{escape(title)}','{escape(body)}','Info');"
+        "Start-Sleep -Seconds 8;$n.Dispose()"
+    )
+    try:
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", script],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except (OSError, subprocess.SubprocessError) as e:
+        logger.warning(f"Windows 通知发不出去：{e}")
+        return False
+
+
+#: 要连续几次都读到「不是我们的壁纸」才真的暂停，避免刚开机/刚切屏的瞬时状态误报
+_FOREIGN_STRIKES_NEEDED = 2
+_foreignStrikes = 0
+
+
 def checkWallpaperReplaced(cfg: dict | None = None) -> bool:
     """
     检测壁纸是不是被人手动换掉了
 
     是的话：把轮换暂停写进配置 + 发一条桌面通知，返回 True。
-    还没成功设置过壁纸（last_applied 为空）时不检测，避免第一次运行就误报。
+    还没成功设置过壁纸（last_applied 为空）时不检测，避免第一次运行就误报；
+    并且要连续读到两次「不是我们的壁纸」才真的暂停。
     """
+    global _foreignStrikes
+
     cfg = cfg or loadConfig()
     if not cfg.get("watch_wallpaper", True):
         return False
@@ -723,15 +804,26 @@ def checkWallpaperReplaced(cfg: dict | None = None) -> bool:
         return False  # 还没设过壁纸，谈不到"被换掉"
 
     screens = foreignWallpaperScreens()
+    if screens is None:
+        return False  # 这个后端不支持回读
     if not screens:
+        _foreignStrikes = 0
         return False
 
-    from urllib.parse import unquote
-
     names = "、".join(
-        os.path.basename(unquote(url)) or url for _, url in screens[:3]
+        os.path.basename(normalizeWallpaper(url)) or url for _, url in screens[:3]
     )
     where = "/".join(str(screen) for screen, _ in screens)
+
+    _foreignStrikes += 1
+    if _foreignStrikes < _FOREIGN_STRIKES_NEEDED:
+        logger.info(
+            f"第 {_foreignStrikes} 次读到壁纸不是本程序设的"
+            f"（screen {where} → {names}），再确认一次"
+        )
+        return False
+
+    _foreignStrikes = 0
     logger.warning(f"检测到壁纸被手动更换（screen {where} → {names}），暂停自动轮换")
 
     cfg["rotation_paused"] = True
@@ -748,7 +840,6 @@ def checkWallpaperReplaced(cfg: dict | None = None) -> bool:
     )
     return True
 
-
 # --------------------------------------------------------------------------
 # 开机自启动（XDG autostart）
 # --------------------------------------------------------------------------
@@ -759,12 +850,32 @@ def _quoteExec(path: str) -> str:
     return '"' + path.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+_AUTOSTART_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_AUTOSTART_VALUE_NAME = "FY4B"
+
+
 def isAutostartEnabled() -> bool:
+    """开机自启动开着没有（Linux 看 .desktop 文件，Windows 看注册表 Run 项）"""
+    if platform.system() == "Windows":
+        try:
+            import winreg
+
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_RUN_KEY) as key:
+                winreg.QueryValueEx(key, _AUTOSTART_VALUE_NAME)
+            return True
+        except OSError:
+            return False
     return os.path.isfile(autostartPath)
 
-
 def setAutostart(enabled: bool) -> bool:
-    """开关开机自启动；自启动时用轻量模式，不会在登录时弹窗口"""
+    """
+    开关开机自启动；自启动时用轻量模式，不会在登录时弹窗口
+
+    Linux 写 XDG autostart 的 .desktop，Windows 写 HKCU 的 Run 项。
+    """
+    if platform.system() == "Windows":
+        return _setAutostartWindows(enabled)
+
     if enabled:
         gui = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui.py")
         content = (
@@ -799,37 +910,65 @@ def setAutostart(enabled: bool) -> bool:
     return True
 
 
+def _setAutostartWindows(enabled: bool) -> bool:
+    """Windows：写 HKCU 的 Run 项（比往启动文件夹丢脚本干净，也更好删）"""
+    try:
+        import winreg
+    except ImportError:
+        return False
+
+    try:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_RUN_KEY) as key:
+            if not enabled:
+                try:
+                    winreg.DeleteValue(key, _AUTOSTART_VALUE_NAME)
+                except FileNotFoundError:
+                    pass
+                logger.info("已关闭开机自启动")
+                return True
+
+            gui = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui.py")
+            exe = sys.executable
+            pythonw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+            if os.path.isfile(pythonw):
+                exe = pythonw  # 用 pythonw 才不会闪一个黑窗口
+            command = f'"{exe}" "{gui}" --light'
+            winreg.SetValueEx(key, _AUTOSTART_VALUE_NAME, 0, winreg.REG_SZ, command)
+            logger.info(f"已开启开机自启动：{command}")
+            return True
+    except OSError as e:
+        logger.error(f"写注册表自启动失败：{e}")
+        return False
+
 def setWallpaper(
     image_path: str, backend: str | None = None, cfg: dict | None = None
 ) -> bool:
     """设置壁纸，返回是否成功"""
     cfg = cfg or loadConfig()
-    backend = backend or detectBackend(cfg)
+    name = backend or detectBackend(cfg)
+    impl = backends.getBackend(name)
 
     if not os.path.isfile(image_path):
         raise FileNotFoundError(image_path)
 
-    if backend == "niri":
-        # WARN: 这个地方后面该封装成函数，比如 awww,hyprpaper 等等壁纸设定程序（wayland 的壁纸设定程序真多……）
-        subprocess.run(
-            ["awww", "img", "-a", "--transition-type=center", image_path],
-            check=True,
-        )
-    elif backend == "KDE":
-        setWallpaper_KDE(image_path)
-    else:
-        logger.error(
-            f"还没开始写，或者错误：当前桌面环境 {backend} 不支持，"
-            f"可以在配置里把 wallpaper_backend 设为 KDE 或 niri"
-        )
+    if impl is None:
+        logger.error(f"未知的壁纸后端 {name}，可选：{', '.join(backends.backendChoices())}")
         return False
 
-    logger.info(f"壁纸已设置：{os.path.basename(image_path)}")
+    if not impl.available():
+        logger.warning(f"后端 {name} 在当前环境看起来不可用，还是试一下")
+
+    try:
+        impl.setWallpaper(image_path)
+    except Exception as e:
+        logger.error(f"后端 {name} 设置壁纸失败：{type(e).__name__}: {e}")
+        return False
+
+    logger.info(f"壁纸已设置（{name}）：{os.path.basename(image_path)}")
     recordApplied(image_path)
     if cfg.get("verify", True):
-        verifyWallpaper(image_path, backend)
+        verifyWallpaper(image_path, name)
     return True
-
 
 def update(cfg: dict | None = None, force: bool = False) -> str | None:
     """

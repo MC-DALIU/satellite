@@ -16,6 +16,7 @@
 | --- | --- | --- |
 | `Wallpaper/FY4B.py` | 风云四号 B 星云图壁纸 | **保留**，重构并修复了 bug |
 | `Wallpaper/gui.py` | 无 | **新增**：设置界面、裁切预览、完整/轻量双模式、托盘、开机自启动 |
+| `Wallpaper/backends.py` | 无 | **新增**：壁纸后端注册表（KDE / niri / Windows，可扩展） |
 | `Wallpaper/H8.py` | 向日葵 9 号云图壁纸（依赖的链接早已失效） | 已删除 |
 | `downloadDigitalTyphoon/` | 批量下载数字台风网图片 | 已删除 |
 
@@ -64,10 +65,23 @@ KDE 下这个接口读的是运行中的壁纸插件状态（`org.kde.PlasmaShel
 * **轮换保护**：壁纸被手动换掉时自动暂停轮换并通知你，不会跟你抢壁纸。
 * **单实例**：本地 socket + 文件锁双重保证，重复启动只会叫出已有窗口。
 
-## 依赖
+## 安装
+
+**一条命令装完所有 Python 依赖**（仓库根目录有 `requirements.txt`）：
 
 ```bash
-sudo pacman -S python-requests python-pillow python-filelock python-apscheduler python-dbus python-pyqt5 psmisc
+pip install -r requirements.txt
+```
+
+首次运行时如果还缺依赖，程序会**自己发现并帮你装上**（不想自动装就设环境变量
+`FY4B_NO_AUTO_INSTALL=1`），装不上时也会明确告诉你该执行哪条命令，而不是甩一个
+`ModuleNotFoundError`。
+
+<details>
+<summary>用系统包管理器安装（Arch 等发行版推荐）</summary>
+
+```bash
+sudo pacman -S python-pillow python-filelock python-apscheduler python-pyqt5 python-dbus psmisc
 ```
 
 * `python-pyqt5` 只有图形界面需要，纯命令行运行可以不装
@@ -76,6 +90,18 @@ sudo pacman -S python-requests python-pillow python-filelock python-apscheduler 
   缺了它程序照样能跑，只是认不出没写过 pid 文件的老进程
 * 在 `niri` 下需要 [awww](https://github.com/UnkwUsr/awww) 来设置壁纸
 * 桌面通知优先走 D-Bus（KDE / GNOME 自带），失败才退回 `notify-send`（libnotify，可选）
+* Arch 上 `pip install` 会被 PEP 668 拦住（`externally-managed-environment`），
+  直接用 pacman 装这一行即可
+</details>
+
+**Windows 上不需要 `python-dbus` 和 `psmisc`**：
+
+```powershell
+pip install -r requirements.txt
+```
+
+依赖只有 4 个（图源下载用的是标准库 `urllib`，所以**不需要 `requests`**）：
+`pillow`、`filelock`、`apscheduler`，图形界面再加 `PyQt5`。
 
 ## 使用
 
@@ -166,6 +192,20 @@ python3 Wallpaper/FY4B.py --gui        # 打开图形界面
 
 风云四号 B 星的云图源在中国大陆可以直接访问，不需要代理。
 
+## 自检脚本
+
+```bash
+python3 Wallpaper/selftest.py          # Windows: python Wallpaper\selftest.py
+```
+
+**不联网、不改壁纸、不碰真实配置**，只把关键逻辑跑一遍（37 项）：静态检查有没有
+「引用了但没定义」的名字、路径归一化、裁剪框夹取、后端注册表、Windows 注册表解码、
+以及「壁纸被手动更换」的判定链。换平台或改完代码后建议先跑一次，输出直接发出来就能定位问题。
+
+写它的原因很实际：有一类 bug 只在**运行时**才暴露 —— 比如改代码时误删了一个常量，
+程序启动一切正常，等几分钟后「替换检测」第一次触发才抛 NameError。所以这个脚本会
+真的去调用那几条分支，而不只是 import 一下。
+
 ## 配置
 
 配置文件在 `~/.config/fy4b/config.json`，界面里改的项都会写到这里；直接手改也可以，
@@ -196,10 +236,40 @@ python3 Wallpaper/FY4B.py --gui        # 打开图形界面
 
 ## 支持的环境
 
-* `niri`：调用 `awww img`
-* `KDE Plasma`：通过 D-Bus 调用 plasmashell 的脚本接口
+壁纸后端全部在 [`Wallpaper/backends.py`](Wallpaper/backends.py) 里。
+**要支持一个新桌面环境，只需要在那里加一个 `Backend` 子类，并在 `BACKENDS`
+里注册一行**，核心逻辑（下载 / 裁切 / 自检 / 暂停轮换）完全不用动。
 
-其他桌面环境暂时没有实现，设置壁纸的部分欢迎提交 Issue 或 PR。
+| 后端 | 做法 | 回读（决定「被替换」检测） | 状态 |
+| --- | --- | --- | --- |
+| KDE Plasma | D-Bus 调 plasmashell 的脚本接口 | 支持 | 已真机验证 |
+| niri | `awww img` | 暂不支持 | 已真机验证 |
+| Windows | `SystemParametersInfoW` + 注册表 | 尽力而为 | **未在真机验证** |
+
+预留的坑位（还没实现，加的时候照 `NiriBackend` 抄一个类即可）：
+GNOME / Budgie、Cinnamon / MATE、XFCE、sway、Hyprland、通用 X11（feh / xwallpaper）。
+
+### Windows 说明
+
+```powershell
+pip install requests pillow filelock apscheduler PyQt5
+python Wallpaper\gui.py
+```
+
+* 设置壁纸走 `SystemParametersInfoW`，同时把 `HKCU\Control Panel\Desktop` 里的
+  显示方式设成「填充」，免得 Windows 用居中/拉伸把裁切构图毁掉
+* 「壁纸被手动更换」的检测读同一个注册表键（`WallPaper`，读不到再尝试解析
+  `TranscodedImageCache`）。那个二进制格式微软没公开，属于尽力而为：
+  **解析不出来就自动跳过检测，不会误报成"被换掉了"**
+* 开机自启动写 `HKCU\...\CurrentVersion\Run`，并用 `pythonw.exe` 启动，不闪黑窗口
+* 桌面通知用 PowerShell 气泡实现
+* 数据目录在 `%LOCALAPPDATA%\fy4b`，配置在 `%APPDATA%\fy4b\config.json`
+* 换图不生效时先跑 `python Wallpaper\selftest.py`，它会直接指出是哪一环坏了
+
+⚠️ **这一部分是照着 Win32 API 写的，没有在真实的 Windows 上跑过**（开发机是 Linux）。
+如果换图不生效，先看 `%LOCALAPPDATA%\fy4b\fy4b.log` 的报错，以及「更新后自检」
+那一行的结论；也可以在配置里把 `wallpaper_backend` 强制成 `Windows` 复现。
+
 上游 README 中提到的 `feh` 属于已删除的 `H8.py`，本仓库不再需要。
 
 ## 许可证与来源
